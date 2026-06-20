@@ -1,4 +1,6 @@
 use rayon::prelude::*;
+use crossbeam_channel::{Sender, bounded};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::{
     DefectProfile, DefectSeverity, PipeScanSegment, WALL_THICKNESS_M,
@@ -12,6 +14,59 @@ const INVERSION_TOLERANCE: f64 = 1e-8;
 const GAUSSIAN_FILTER_WINDOW: usize = 5;
 const MAGNETIZATION_A_M: f64 = 1.0e6;
 const NOISE_THRESHOLD_T: f64 = 5.0e-6;
+
+const PROGRESS_THROTTLE_EVERY: u64 = 256;
+
+pub enum ProgressMsg {
+    StageReading(f64),
+    StageInverting(f64),
+    StageStats(f64),
+    Done,
+}
+
+pub struct ProgressReporter {
+    sender: Sender<ProgressMsg>,
+    invert_counter: AtomicU64,
+    read_counter: AtomicU64,
+    total_work: u64,
+}
+
+impl ProgressReporter {
+    pub fn new(sender: Sender<ProgressMsg>, total_work: u64) -> Self {
+        Self {
+            sender,
+            invert_counter: AtomicU64::new(0),
+            read_counter: AtomicU64::new(0),
+            total_work,
+        }
+    }
+
+    #[inline]
+    pub fn tick_read(&self, delta: u64) {
+        let prev = self.read_counter.fetch_add(delta, Ordering::Relaxed);
+        if (prev + delta) / PROGRESS_THROTTLE_EVERY != prev / PROGRESS_THROTTLE_EVERY {
+            let ratio = (prev + delta) as f64 / self.total_work.max(1) as f64;
+            let _ = self.sender.try_send(ProgressMsg::StageReading(ratio.min(1.0)));
+        }
+    }
+
+    #[inline]
+    pub fn tick_invert(&self, delta: u64) {
+        let prev = self.invert_counter.fetch_add(delta, Ordering::Relaxed);
+        if (prev + delta) / PROGRESS_THROTTLE_EVERY != prev / PROGRESS_THROTTLE_EVERY {
+            let ratio = (prev + delta) as f64 / self.total_work.max(1) as f64;
+            let _ = self.sender.try_send(ProgressMsg::StageInverting(ratio.min(1.0)));
+        }
+    }
+
+    pub fn done(&self) {
+        let _ = self.sender.send(ProgressMsg::Done);
+    }
+}
+
+pub fn create_progress_channel() -> (Sender<ProgressMsg>, crossbeam_channel::Receiver<ProgressMsg>) {
+    bounded::<ProgressMsg>(16)
+}
 
 pub struct DipoleInverter {
     wall_thickness: f64,
@@ -44,6 +99,14 @@ impl DipoleInverter {
     }
 
     pub fn invert_segment_parallel(&self, segment: &mut PipeScanSegment) {
+        self.invert_segment_parallel_with_progress(segment, None)
+    }
+
+    pub fn invert_segment_parallel_with_progress(
+        &self,
+        segment: &mut PipeScanSegment,
+        reporter: Option<&ProgressReporter>,
+    ) {
         let num_sensors = segment.sensor_data.len();
         let num_samples = segment.sensor_data[0].len();
 
@@ -57,6 +120,8 @@ impl DipoleInverter {
             let baseline = estimate_baseline(&signal);
             let anomaly: Vec<f64> = signal.iter().map(|&v| v - baseline).collect();
             let filtered = gaussian_filter(&anomaly, GAUSSIAN_FILTER_WINDOW);
+
+            let mut local_ticks: u64 = 0;
 
             for s in 0..num_samples {
                 let anomaly_magnitude = filtered[s].abs();
@@ -76,6 +141,20 @@ impl DipoleInverter {
                     axial_length_m: axial_length,
                     severity,
                 };
+
+                local_ticks += 1;
+                if local_ticks >= PROGRESS_THROTTLE_EVERY {
+                    if let Some(r) = reporter {
+                        r.tick_invert(local_ticks);
+                    }
+                    local_ticks = 0;
+                }
+            }
+
+            if local_ticks > 0 {
+                if let Some(r) = reporter {
+                    r.tick_invert(local_ticks);
+                }
             }
         });
 
@@ -90,42 +169,65 @@ impl DipoleInverter {
         _sensor_idx: usize,
         axial_resolution: f64,
     ) -> (f64, f64) {
-        if anomaly_magnitude < NOISE_THRESHOLD_T {
+        if anomaly_magnitude < NOISE_THRESHOLD_T || !anomaly_magnitude.is_finite() {
             return (0.0, 0.0);
         }
 
-        let axial_length = estimate_axial_length(signal, center_idx, axial_resolution);
+        let safe_center = center_idx.min(signal.len().saturating_sub(1));
+
+        let axial_length = estimate_axial_length(signal, safe_center, axial_resolution);
+
+        if !axial_length.is_finite() || axial_length <= 0.0 {
+            return (0.0, 0.0);
+        }
 
         let depth = self.dipole_depth_inversion(anomaly_magnitude, axial_length);
 
-        (depth.min(self.wall_thickness * 0.95), axial_length)
+        if depth.is_finite() && depth > 0.0 {
+            (depth.min(self.wall_thickness * 0.95).max(0.0), axial_length)
+        } else {
+            (0.0, 0.0)
+        }
     }
 
     fn dipole_depth_inversion(&self, b_radial_peak: f64, axial_length: f64) -> f64 {
         if b_radial_peak < 1e-12 || axial_length < 1e-6 {
             return 0.0;
         }
+        if !b_radial_peak.is_finite() || !axial_length.is_finite() {
+            return 0.0;
+        }
 
         let target = b_radial_peak.abs();
 
         let b_max = self.forward_dipole_field(self.wall_thickness * 0.99, axial_length);
-        if target >= b_max {
+        if !b_max.is_finite() || target >= b_max {
             return self.wall_thickness * 0.99;
         }
 
         let b_min = self.forward_dipole_field(self.wall_thickness * 0.01, axial_length);
-        if target <= b_min {
+        if !b_min.is_finite() || target <= b_min {
             return self.wall_thickness * 0.01;
+        }
+
+        if b_max <= b_min {
+            return self.wall_thickness * 0.5;
         }
 
         let mut low = self.wall_thickness * 0.01;
         let mut high = self.wall_thickness * 0.99;
 
-        for _ in 0..self.max_iterations {
+        let mut iter_count = 0;
+        while iter_count < self.max_iterations {
             let mid = (low + high) * 0.5;
             let b_mid = self.forward_dipole_field(mid, axial_length);
 
-            if (b_mid - target).abs() / target < self.tolerance {
+            if !b_mid.is_finite() {
+                break;
+            }
+
+            let rel_err = (b_mid - target).abs() / target;
+            if rel_err < self.tolerance {
                 return mid;
             }
 
@@ -138,46 +240,57 @@ impl DipoleInverter {
             if (high - low) / self.wall_thickness < 1e-6 {
                 break;
             }
+            iter_count += 1;
         }
 
         (low + high) * 0.5
     }
 
     fn forward_dipole_field(&self, depth: f64, axial_length: f64) -> f64 {
+        if !depth.is_finite() || !axial_length.is_finite() {
+            return 0.0;
+        }
+
+        let safe_depth = depth.max(1e-9).min(self.wall_thickness);
+        let safe_axial = axial_length.max(1e-9);
+
         let z_sensor = self.wall_thickness + self.lift_off;
-        let z_defect_top = self.wall_thickness - depth;
-        let z_center = z_defect_top + depth / 2.0;
+        let z_defect_top = self.wall_thickness - safe_depth;
+        let z_center = z_defect_top + safe_depth / 2.0;
 
         let dz = z_sensor - z_center;
-        let half_length = axial_length / 2.0;
+        let half_length = safe_axial / 2.0;
 
         let num_dipoles = DIPOLE_GRID_SIZE;
         let mut total_field = 0.0;
+        let inv_4pi = self.permeability / (4.0 * std::f64::consts::PI);
+        let m_z = safe_depth * 2.0;
 
         for i in 0..num_dipoles {
             let frac = (i as f64 + 0.5) / num_dipoles as f64;
-            let x_dipole = -half_length + frac * axial_length;
+            let x_dipole = -half_length + frac * safe_axial;
 
             let r_sq = x_dipole * x_dipole + dz * dz;
+            if r_sq < 1e-18 {
+                continue;
+            }
             let r = r_sq.sqrt();
-
-            if r < 1e-9 {
+            let r_5 = r_sq * r_sq * r;
+            if r_5 < 1e-45 {
                 continue;
             }
 
-            let r_5 = r_sq * r_sq * r;
+            let term_3dz2_rsq = 3.0 * dz * dz - r_sq;
 
-            let m_z = depth * 2.0;
+            let b_radial = inv_4pi * m_z * term_3dz2_rsq / r_5;
 
-            let b_radial = self.permeability / (4.0 * std::f64::consts::PI)
-                * m_z
-                * (3.0 * dz * dz - r_sq)
-                / r_5;
-
-            total_field += b_radial;
+            if b_radial.is_finite() {
+                total_field += b_radial;
+            }
         }
 
-        total_field / num_dipoles as f64
+        let avg = total_field / num_dipoles as f64;
+        if avg.is_finite() { avg } else { 0.0 }
     }
 }
 
@@ -186,22 +299,35 @@ fn estimate_baseline(signal: &[f64]) -> f64 {
         return 0.0;
     }
 
-    let mut sorted: Vec<f64> = signal.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut cleaned: Vec<f64> = signal
+        .iter()
+        .copied()
+        .filter(|&v| v.is_finite())
+        .collect();
 
-    let n = sorted.len();
-    let lower_quartile = sorted[n / 4];
-    let upper_quartile = sorted[3 * n / 4];
+    if cleaned.is_empty() {
+        return 0.0;
+    }
+
+    cleaned.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = cleaned.len();
+    let lower_quartile = cleaned[n / 4];
+    let upper_quartile = cleaned[3 * n / 4];
     let iqr = upper_quartile - lower_quartile;
 
-    let filtered: Vec<f64> = sorted
+    if !iqr.is_finite() || iqr.abs() < 1e-18 {
+        return cleaned[n / 2];
+    }
+
+    let filtered: Vec<f64> = cleaned
         .iter()
         .filter(|&&v| v >= lower_quartile - 1.5 * iqr && v <= upper_quartile + 1.5 * iqr)
         .copied()
         .collect();
 
     if filtered.is_empty() {
-        return sorted[n / 2];
+        return cleaned[n / 2];
     }
 
     filtered.iter().sum::<f64>() / filtered.len() as f64
@@ -223,6 +349,9 @@ fn gaussian_filter(signal: &[f64], window_size: usize) -> Vec<f64> {
     }
 
     let sum: f64 = kernel.iter().sum();
+    if sum.abs() < 1e-18 {
+        return signal.to_vec();
+    }
     for k in &mut kernel {
         *k /= sum;
     }
@@ -233,38 +362,52 @@ fn gaussian_filter(signal: &[f64], window_size: usize) -> Vec<f64> {
         let mut val = 0.0;
         for j in 0..window_size {
             let idx = (i as isize - half as isize + j as isize).max(0).min(n as isize - 1) as usize;
-            val += signal[idx] * kernel[j];
+            let sv = signal[idx];
+            if sv.is_finite() {
+                val += sv * kernel[j];
+            }
         }
-        result[i] = val;
+        result[i] = if val.is_finite() { val } else { 0.0 };
     }
 
     result
 }
+
+const AXIAL_SEARCH_MAX_STEPS: usize = 4096;
 
 fn estimate_axial_length(signal: &[f64], center_idx: usize, axial_resolution: f64) -> f64 {
     if signal.is_empty() {
         return 0.0;
     }
 
-    let peak = signal[center_idx].abs();
-    if peak < 1e-12 {
+    let safe_center = center_idx.min(signal.len().saturating_sub(1));
+    let peak = signal[safe_center].abs();
+    if peak < 1e-12 || !peak.is_finite() {
         return 0.0;
     }
 
     let threshold = peak * 0.5;
 
-    let mut left = center_idx;
-    while left > 0 && signal[left].abs() > threshold {
+    let mut left = safe_center;
+    let mut steps = 0;
+    while left > 0 && signal[left].abs() > threshold && steps < AXIAL_SEARCH_MAX_STEPS {
         left -= 1;
+        steps += 1;
     }
 
-    let mut right = center_idx;
-    while right < signal.len() - 1 && signal[right].abs() > threshold {
+    let mut right = safe_center;
+    steps = 0;
+    while right < signal.len().saturating_sub(1)
+        && signal[right].abs() > threshold
+        && steps < AXIAL_SEARCH_MAX_STEPS
+    {
         right += 1;
+        steps += 1;
     }
 
-    let width_samples = right - left;
-    width_samples as f64 * axial_resolution
+    let width_samples = right.saturating_sub(left).min(signal.len());
+    let width = width_samples as f64 * axial_resolution;
+    if width.is_finite() { width } else { 0.0 }
 }
 
 pub fn compute_statistics(
@@ -282,7 +425,10 @@ pub fn compute_statistics(
     for segment in segments {
         for sensor_row in &segment.defect_map {
             for profile in sensor_row {
-                all_depths.push(profile.depth_m);
+                let d = profile.depth_m;
+                if d.is_finite() && d > 0.0 {
+                    all_depths.push(d);
+                }
 
                 match profile.severity {
                     DefectSeverity::Critical => total_critical += 1,
@@ -307,7 +453,7 @@ pub fn compute_statistics(
                 defect_map = vec![Vec::with_capacity(all_depths.len() / num_sensors.max(1)); num_sensors];
             }
 
-            for s in 0..num_sensors {
+            for s in 0..num_sensors.min(segment.defect_map.len()) {
                 defect_map[s].extend_from_slice(&segment.defect_map[s]);
             }
         }

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::time::Instant;
+use std::thread;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,7 +14,7 @@ mod renderer;
 
 use crate::types::{FileFormat, ByteOrder, SENSOR_COUNT, SAMPLE_RATE_HZ, PIG_SPEED_M_S, WALL_THICKNESS_M};
 use crate::file_reader::{MflFileReader, generate_test_file};
-use crate::dipole::{DipoleInverter, compute_statistics};
+use crate::dipole::{DipoleInverter, compute_statistics, ProgressReporter, ProgressMsg, create_progress_channel};
 use crate::renderer::AsciiRenderer;
 
 #[derive(Parser, Debug)]
@@ -138,6 +139,31 @@ fn main() -> Result<()> {
     }
 }
 
+fn render_progress_bar(percent: f64, color_enabled: bool) -> String {
+    let width = 40usize;
+    let pct = percent.clamp(0.0, 1.0);
+    let filled = (pct * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+
+    let bar: String = std::iter::repeat('#').take(filled).collect::<String>()
+        + &std::iter::repeat('-').take(empty).collect::<String>();
+
+    if color_enabled {
+        let color_code = if pct >= 0.9 {
+            "\x1b[38;5;82m"
+        } else if pct >= 0.6 {
+            "\x1b[38;5;190m"
+        } else if pct >= 0.3 {
+            "\x1b[38;5;214m"
+        } else {
+            "\x1b[38;5;202m"
+        };
+        format!("\r  {}[{}]\x1b[0m {:5.1}%", color_code, bar, pct * 100.0)
+    } else {
+        format!("\r  [{}] {:5.1}%", bar, pct * 100.0)
+    }
+}
+
 fn run_analyze(
     input: &std::path::Path,
     num_sensors: usize,
@@ -181,9 +207,53 @@ fn run_analyze(
     println!("  [LOAD] Pipeline length: {:.2} m", reader.total_length_m());
     println!();
 
+    let total_work_units = (reader.total_samples() * num_sensors) as u64;
+
+    let (tx, rx) = create_progress_channel();
+    let reporter = ProgressReporter::new(tx.clone(), total_work_units);
+
+    let color_for_thread = color_enabled;
+    let progress_handle = thread::spawn(move || {
+        let mut last_pct_read = -1.0f64;
+        let mut last_pct_inv = -1.0f64;
+        let mut current_stage_read = true;
+
+        for msg in rx.iter() {
+            match msg {
+                ProgressMsg::StageReading(pct) => {
+                    if (pct - last_pct_read).abs() >= 0.01 || pct >= 1.0 {
+                        current_stage_read = true;
+                        last_pct_read = pct;
+                        eprint!("{}", render_progress_bar(pct, color_for_thread));
+                        eprint!(" READ");
+                    }
+                }
+                ProgressMsg::StageInverting(pct) => {
+                    if (pct - last_pct_inv).abs() >= 0.01 || pct >= 1.0 {
+                        if current_stage_read {
+                            eprintln!();
+                            current_stage_read = false;
+                        }
+                        last_pct_inv = pct;
+                        eprint!("{}", render_progress_bar(pct, color_for_thread));
+                        eprint!(" INVERT");
+                    }
+                }
+                ProgressMsg::StageStats(_pct) => {}
+                ProgressMsg::Done => {
+                    if !current_stage_read {
+                        eprintln!();
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
     println!("  [READ] Reading file in parallel chunks...");
-    let mut segments = reader.read_all_parallel()?;
+    let mut segments = reader.read_all_parallel_with_progress(Some(&reporter))?;
     let read_time = start.elapsed();
+    eprintln!();
     println!("  [READ] Read complete in {:.2?}", read_time);
     println!();
 
@@ -193,11 +263,15 @@ fn run_analyze(
 
     let invert_start = Instant::now();
     for segment in &mut segments {
-        inverter.invert_segment_parallel(segment);
+        inverter.invert_segment_parallel_with_progress(segment, Some(&reporter));
     }
     let invert_time = invert_start.elapsed();
+    eprintln!();
     println!("  [INVERT] Inversion complete in {:.2?}", invert_time);
     println!();
+
+    reporter.done();
+    let _ = progress_handle.join();
 
     println!("  [STATS] Computing defect statistics...");
     let result = compute_statistics(&segments, wall_thickness);

@@ -17,6 +17,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 num_cpus = "1.16"
 byteorder = "1.5"
+crossbeam-channel = "0.5"
 
 [profile.release]
 opt-level = 3

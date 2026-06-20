@@ -7,9 +7,11 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::types::{FileFormat, MflSample, PipeScanSegment, ByteOrder};
+use crate::dipole::ProgressReporter;
 
 const CHUNK_SAMPLES: usize = 10_000;
 const OVERLAP_SAMPLES: usize = 100;
+const READ_PROGRESS_THROTTLE: u64 = 128;
 
 pub struct MflFileReader {
     format: FileFormat,
@@ -56,6 +58,10 @@ impl MflFileReader {
     }
 
     pub fn read_all_parallel(&self) -> Result<Vec<PipeScanSegment>> {
+        self.read_all_parallel_with_progress(None)
+    }
+
+    pub fn read_all_parallel_with_progress(&self, reporter: Option<&ProgressReporter>) -> Result<Vec<PipeScanSegment>> {
         let chunk_size = CHUNK_SAMPLES;
         let num_chunks = (self.total_samples + chunk_size - 1) / chunk_size;
 
@@ -65,7 +71,21 @@ impl MflFileReader {
                 let start_sample = chunk_idx * chunk_size;
                 let end_sample = ((chunk_idx + 1) * chunk_size + OVERLAP_SAMPLES).min(self.total_samples);
                 let actual_start = start_sample.saturating_sub(if chunk_idx > 0 { OVERLAP_SAMPLES } else { 0 });
-                self.read_segment(actual_start, end_sample)
+                let seg = self.read_segment(actual_start, end_sample)?;
+
+                if let Some(r) = reporter {
+                    let work_units = ((end_sample - actual_start) * self.num_sensors) as u64;
+                    let mut tick_accum = work_units;
+                    while tick_accum >= READ_PROGRESS_THROTTLE {
+                        r.tick_read(READ_PROGRESS_THROTTLE);
+                        tick_accum -= READ_PROGRESS_THROTTLE;
+                    }
+                    if tick_accum > 0 {
+                        r.tick_read(tick_accum);
+                    }
+                }
+
+                Ok(seg)
             })
             .collect();
 
