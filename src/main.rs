@@ -11,11 +11,13 @@ mod types;
 mod file_reader;
 mod dipole;
 mod renderer;
+mod asme_b31g;
 
-use crate::types::{FileFormat, ByteOrder, SENSOR_COUNT, SAMPLE_RATE_HZ, PIG_SPEED_M_S, WALL_THICKNESS_M};
+use crate::types::{FileFormat, ByteOrder, SENSOR_COUNT, SAMPLE_RATE_HZ, PIG_SPEED_M_S, WALL_THICKNESS_M, PIPE_DIAMETER_M};
 use crate::file_reader::{MflFileReader, generate_test_file};
 use crate::dipole::{DipoleInverter, compute_statistics, ProgressReporter, ProgressMsg, create_progress_channel};
 use crate::renderer::AsciiRenderer;
+use crate::asme_b31g::{AsmeB31gParams, evaluate_asme_b31g, render_b31g_report, render_critical_alert};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,6 +67,18 @@ enum Commands {
 
         #[arg(short = 'o', long, help = "Output file for JSON report")]
         output: Option<PathBuf>,
+
+        #[arg(long = "eval-asme-b31g", default_value_t = false, help = "Enable ASME B31G remaining strength assessment")]
+        eval_asme_b31g: bool,
+
+        #[arg(long, default_value_t = 290_000_000.0, help = "Specified Minimum Yield Strength in Pascals")]
+        smys: f64,
+
+        #[arg(long, default_value_t = PIPE_DIAMETER_M, help = "Pipe outer diameter in meters")]
+        pipe_od: f64,
+
+        #[arg(long, default_value_t = 10_000_000.0, help = "Current operating pressure in Pascals")]
+        op_pressure: f64,
     },
 
     #[command(name = "gentest", about = "Generate a test MFL data file with simulated defects")]
@@ -113,6 +127,10 @@ fn main() -> Result<()> {
             byte_order,
             bytes_per_sample,
             output,
+            eval_asme_b31g,
+            smys,
+            pipe_od,
+            op_pressure,
         } => {
             run_analyze(
                 input,
@@ -124,6 +142,10 @@ fn main() -> Result<()> {
                 *bytes_per_sample,
                 output.as_deref(),
                 color_enabled,
+                *eval_asme_b31g,
+                *smys,
+                *pipe_od,
+                *op_pressure,
             )
         }
         Commands::GenTest {
@@ -174,6 +196,10 @@ fn run_analyze(
     bytes_per_sample: usize,
     _output: Option<&std::path::Path>,
     color_enabled: bool,
+    eval_b31g: bool,
+    smys: f64,
+    pipe_od: f64,
+    op_pressure: f64,
 ) -> Result<()> {
     print_banner(color_enabled);
 
@@ -287,6 +313,31 @@ fn run_analyze(
     let render = renderer.render_unfolded_map(&result);
     println!();
     println!("{}", render);
+
+    if eval_b31g {
+        println!();
+        println!("  [B31G] Running ASME B31G remaining strength assessment...");
+        let b31g_start = Instant::now();
+
+        let b31g_params = AsmeB31gParams {
+            smys_pa: smys,
+            nominal_wall_thickness_m: wall_thickness,
+            outer_diameter_m: pipe_od,
+            operating_pressure_pa: op_pressure,
+        };
+
+        let b31g_result = evaluate_asme_b31g(&result, b31g_params);
+        let b31g_time = b31g_start.elapsed();
+
+        println!("  [B31G] Assessment complete in {:.2?}", b31g_time);
+
+        if b31g_result.is_overpressure {
+            println!();
+            println!("{}", render_critical_alert());
+        }
+
+        println!("{}", render_b31g_report(&b31g_result, &b31g_params, color_enabled));
+    }
 
     let total_time = start.elapsed();
     println!();
